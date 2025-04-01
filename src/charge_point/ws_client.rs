@@ -1,7 +1,10 @@
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures::{SinkExt, StreamExt};
+use std::sync::Arc;
+use tokio::sync::Mutex; // Use Tokio's Mutex
 use crate::charge_point::charger::Charger;
+use crate::ocpp::messages::OcppMessage;
 
 pub async fn connect(id: &str, power_rating: f64, ws_url: &str) {
     let (ws_stream, _) = connect_async(ws_url).await.expect("Failed to connect");
@@ -13,13 +16,17 @@ pub async fn connect(id: &str, power_rating: f64, ws_url: &str) {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let text = serde_json::to_string(&msg).unwrap();
-            write.send(Message::Text(text)).await.unwrap();
+            write.send(Message::Text(text.into())).await.unwrap();
         }
     });
 
-    // Charger logic
-    let mut charger = Charger::new(id, power_rating);
+    // Create a shared Charger instance with Tokio's Mutex
+    let charger = Arc::new(Mutex::new(Charger::new(id, power_rating)));
+    let charger_clone = Arc::clone(&charger);
+
+    // Run charger logic in a separate task
     tokio::spawn(async move {
+        let mut charger = charger_clone.lock().await; // Lock asynchronously
         charger.run(&mut |msg| { tx.try_send(msg).unwrap(); }).await;
     });
 
@@ -30,6 +37,7 @@ pub async fn connect(id: &str, power_rating: f64, ws_url: &str) {
             match response {
                 OcppMessage::CallResult { message_id: _, payload } => {
                     if let Some(tx_id) = payload.get("transaction_id").and_then(|v| v.as_str()) {
+                        let mut charger = charger.lock().await; // Lock asynchronously
                         charger.set_transaction_id(tx_id.to_string());
                     }
                 }
@@ -38,3 +46,6 @@ pub async fn connect(id: &str, power_rating: f64, ws_url: &str) {
         }
     }
 }
+
+
+
